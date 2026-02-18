@@ -30,7 +30,7 @@ namespace Application.Tests
         {
             Assert.Throws<ArgumentException>(() =>
             {
-                _service.RegisterUser("Kid", "kid@test.com", 10);
+                _service.RegisterUser("Kid", "kid@test.com", 18);
             });
         }
 
