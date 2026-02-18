@@ -1,13 +1,10 @@
-﻿using Application.Logic;
-using TestFramework; // Ссылка на наш фреймворк
+﻿using TestFramework; 
 using System;
 using System.Collections.Generic;
 using System.Threading;
 
 namespace Application.Logic
 {
-    // Имитация подключения к БД. Это "тяжелый" ресурс.
-    // Реализует ISharedContext, чтобы раннер знал, как его инициализировать.
     public class Database : ISharedContext
     {
         public List<User> Users { get; private set; }
@@ -16,7 +13,6 @@ namespace Application.Logic
         public void Init()
         {
             Console.WriteLine("  [DB] Подключение к базе данных...");
-            // Имитируем задержку соединения
             Thread.Sleep(800);
             Users = new List<User>();
             IsConnected = true;
