@@ -1,21 +1,33 @@
-﻿using System;
+﻿using Application.Tests;
+using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
-using Application.Tests;
 using TestFramework;
 
 namespace TestRunner
 {
     class Program
     {
+        private static readonly object _consoleLock = new object();
+
         static void Main()
         {
             Console.WriteLine("=== TEST RUNNER ===\n");
 
+            int maxDegree = 8;
+            Console.WriteLine($"Максимум потоков: {maxDegree}");
+
             var testTypes = GetTestClasses();
-            var (total, passed, failed) = RunAllTests(testTypes);
+            
+            var sw = Stopwatch.StartNew();
+
+            var (total, passed, failed) = RunAllTests(testTypes, maxDegree);
+
+            sw.Stop();
 
             Console.WriteLine($"\nИТОГО: Запущено: {total}, Успешно: {passed}, Провалено: {failed}");
+            Console.WriteLine($"ВРЕМЯ ВЫПОЛНЕНИЯ: {sw.Elapsed.TotalSeconds:F3} сек.");
             Console.ReadLine();
         }
 
@@ -27,18 +39,18 @@ namespace TestRunner
                 .ToArray();
         }
 
-        private static (int t, int p, int f) RunAllTests(Type[] classes)
+        private static (int t, int p, int f) RunAllTests(Type[] classes, int maxDegree)
         {
             int t = 0, p = 0, f = 0;
             foreach (var type in classes)
             {
-                var res = RunTestsForClass(type);
+                var res = RunTestsForClass(type, maxDegree);
                 t += res.t; p += res.p; f += res.f;
             }
             return (t, p, f);
         }
 
-        static (int t, int p, int f) RunTestsForClass(Type type)
+        static (int t, int p, int f) RunTestsForClass(Type type, int maxDegree)
         {
             LogClassName(type);
 
@@ -51,13 +63,32 @@ namespace TestRunner
             var setup = methods.FirstOrDefault(m => m.HasAttr<SetupAttribute>());
             var teardown = methods.FirstOrDefault(m => m.HasAttr<TeardownAttribute>());
 
-            int t = 0, p = 0, f = 0;
-            var tests = GetSortedTests(methods);
+            var classAttr = type.GetCustomAttribute<TestClassAttribute>();
+            bool runParallel = classAttr?.RunParallel ?? true;
 
-            foreach (var method in tests)
+
+            int t = 0, p = 0, f = 0;
+            var tests = GetSortedTests(methods).ToList();
+
+            if (runParallel)
             {
-                var (mt, mp, mf) = RunTestMethod(type, method, setup, teardown, context);
-                t += mt; p += mp; f += mf;
+                var options = new ParallelOptions { MaxDegreeOfParallelism = maxDegree };
+
+                Parallel.ForEach(tests, options, method =>
+                {
+                    var (mt, mp, mf) = RunTestMethod(type, method, setup, teardown, context);
+                    Interlocked.Add(ref t, mt);
+                    Interlocked.Add(ref p, mp);
+                    Interlocked.Add(ref f, mf);
+                });
+            }
+            else
+            {
+                foreach (var method in tests)
+                {
+                    var (mt, mp, mf) = RunTestMethod(type, method, setup, teardown, context);
+                    t += mt; p += mp; f += mf;
+                }
             }
 
             context?.Cleanup();
@@ -90,25 +121,53 @@ namespace TestRunner
         static bool Execute(Type type, MethodInfo m, MethodInfo? s, MethodInfo? td, object? ctx, object[]? args)
         {
             string name = FormatTestName(m, args);
-            object? instance = null;
+
+            var timeoutAttr = m.GetCustomAttribute<TimeoutAttribute>();
+            int timeoutMs = timeoutAttr?.Milliseconds ?? -1;
 
             try
             {
-                instance = CreateInstance(type, ctx);
-                s?.Invoke(instance, null);
-                m.Invoke(instance, args);
+                object? instance = CreateInstance(type, ctx);
 
-                PrintStatus(name, "PASSED", ConsoleColor.Green);
+                \Action testAction = () =>
+                {
+                    s?.Invoke(instance, null);       
+                    try
+                    {
+                        m.Invoke(instance, args);    
+                    }
+                    catch (TargetInvocationException ex)
+                    {
+                        throw ex.InnerException!;
+                    }
+                    finally
+                    {
+                        InvokeSafe(td, instance);   
+                    }
+                };
+
+                Task task = Task.Run(testAction);
+
+                bool completedInTime = task.Wait(timeoutMs);
+
+                if (!completedInTime)
+                {
+                    PrintStatus(name, "FAILED", ConsoleColor.Red, $"Timeout ({timeoutMs}ms)");
+                    return false;
+                }
+
+                if (task.IsFaulted)
+                {
+                    throw task.Exception!.InnerException!;
+                }
+
+                PrintStatus(name, "PASSED", ConsoleColor.Green, $"(Thread {Thread.CurrentThread.ManagedThreadId})");
                 return true;
             }
             catch (Exception ex)
             {
                 HandleException(name, ex);
                 return false;
-            }
-            finally
-            {
-                InvokeSafe(td, instance);
             }
         }
 
@@ -121,7 +180,7 @@ namespace TestRunner
 
         private static void HandleException(string name, Exception ex)
         {
-            var err = ex is TargetInvocationException tie ? tie.InnerException : ex;
+            var err = ex is AggregateException ae ? ae.Flatten().InnerException : ex;
             bool isAssert = err is TestAssertionException;
             
             var status = isAssert ? "FAILED" : "ERROR";
@@ -157,20 +216,27 @@ namespace TestRunner
 
         private static void LogClassName(Type type)
         {
-            var attr = type.GetCustomAttribute<TestClassAttribute>();
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"\nКЛАСС: {type.Name} {attr?.Description}");
-            Console.ResetColor();
+            lock (_consoleLock)
+            {
+                var attr = type.GetCustomAttribute<TestClassAttribute>();
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"\nКЛАСС: {type.Name} {attr?.Description}");
+                Console.ResetColor();
+            }
         }
 
         private static void PrintStatus(string n, string s, ConsoleColor c, string? msg = null)
         {
-            Console.Write($"[{n}] ");
-            Console.ForegroundColor = c;
-            Console.Write(s);
-            Console.ResetColor();
-            if (msg != null) Console.Write($" -> {msg}");
-            Console.WriteLine();
+            lock (_consoleLock)
+            {
+
+                Console.Write($"[{n}] ");
+                Console.ForegroundColor = c;
+                Console.Write(s);
+                Console.ResetColor();
+                if (msg != null) Console.Write($" -> {msg}");
+                Console.WriteLine();
+            }
         }
     }
 

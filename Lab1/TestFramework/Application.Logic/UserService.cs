@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Application.Logic
@@ -22,6 +23,7 @@ namespace Application.Logic
 
         public void RegisterUser(string username, string email, int age)
         {
+            Thread.Sleep(1000);
             if (string.IsNullOrWhiteSpace(username))
                 throw new ArgumentNullException(nameof(username), "Имя пользователя не может быть пустым");
 
@@ -42,7 +44,12 @@ namespace Application.Logic
                 Age = age
             };
 
-            _database.Users.Add(user);
+            _database.AddUserSafe(user);
+        }
+
+        public void SlowOperation()
+        {
+            Thread.Sleep(2000); 
         }
 
         public User GetByEmail(string email)

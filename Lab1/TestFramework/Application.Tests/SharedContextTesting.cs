@@ -4,7 +4,7 @@ using System;
 
 namespace Application.Tests
 {
-    [TestClass(Description = "Полный сценарий работы с БД с использованием всех 10 Asserts")]
+    [TestClass(Description = "Полный сценарий работы с БД с использованием всех 10 Asserts",RunParallel = false)]
     [UseSharedContext(typeof(Database))]
     public class SharedContextTesting
     {
