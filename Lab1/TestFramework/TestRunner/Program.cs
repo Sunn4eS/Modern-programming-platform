@@ -129,7 +129,7 @@ namespace TestRunner
             {
                 object? instance = CreateInstance(type, ctx);
 
-                \Action testAction = () =>
+                Action testAction = () =>
                 {
                     s?.Invoke(instance, null);       
                     try
