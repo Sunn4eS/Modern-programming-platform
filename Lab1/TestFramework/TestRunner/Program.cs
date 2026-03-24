@@ -35,7 +35,7 @@ namespace TestRunner
 
             Console.WriteLine($"Всего задач (тесты + нагрузка) подготовлено: {loadTasks.Count}");
 
-            using (var pool = new CustomThreadPool(minThreads: 2, maxThreads: 8, idleTimeoutMs: 1000, stuckTimeoutMs: 3000))
+            using (var pool = new CustomThreadPool(minThreads: 2, maxThreads: 20, idleTimeoutMs: 1000, stuckTimeoutMs: 3000))
             {
                 var sw = Stopwatch.StartNew();
 

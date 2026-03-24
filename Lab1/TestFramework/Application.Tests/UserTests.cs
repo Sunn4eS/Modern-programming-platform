@@ -1,10 +1,11 @@
-﻿using Application.Logic;
+﻿
+using Application.Logic;
 using TestFramework;
 using System.Threading;
 
 namespace Application.Tests
 {
-    [TestClass(Description = "Parallel User Properties Testing", RunParallel = true)]
+    [TestClass(RunParallel = true)]
     public class UserPropertiesTests
     {
         [Setup]

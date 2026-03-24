@@ -7,7 +7,6 @@ namespace TestFramework
 {
     public class CustomThreadPool : IDisposable
     {
-        // Переменная, которая хранит красивый ID (от 1 до MaxThreads) для текущего потока
         public static readonly ThreadLocal<int> CurrentWorkerId = new ThreadLocal<int>();
 
         private readonly int _minThreads;
