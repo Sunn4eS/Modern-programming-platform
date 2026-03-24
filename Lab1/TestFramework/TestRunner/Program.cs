@@ -1,33 +1,69 @@
 ﻿using Application.Tests;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using TestFramework;
 
 namespace TestRunner
 {
     class Program
     {
-        private static readonly object _consoleLock = new object();
+        static int _total, _passed, _failed;
 
         static void Main()
         {
-            Console.WriteLine("=== TEST RUNNER ===\n");
-
-            int maxDegree = 8;
-            Console.WriteLine($"Максимум потоков: {maxDegree}");
+            Console.WriteLine("=== МОДЕЛИРОВАНИЕ НАГРУЗКИ (CUSTOM THREAD POOL) ===\n");
 
             var testTypes = GetTestClasses();
-            
-            var sw = Stopwatch.StartNew();
+            var loadTasks = CreateTestActions(testTypes);
 
-            var (total, passed, failed) = RunAllTests(testTypes, maxDegree);
+            int currentTasksCount = loadTasks.Count;
+            for (int i = 1; loadTasks.Count < 60; i++)
+            {
+                int id = i;
+                loadTasks.Add(() => {
+                    Interlocked.Increment(ref _total);
+                    Thread.Sleep(300);
+                    Interlocked.Increment(ref _passed);
 
-            sw.Stop();
+                    PrintStatus($"Нагрузочный_Синтетический_{id}", "PASSED", ConsoleColor.DarkGray);
+                });
+            }
 
-            Console.WriteLine($"\nИТОГО: Запущено: {total}, Успешно: {passed}, Провалено: {failed}");
-            Console.WriteLine($"ВРЕМЯ ВЫПОЛНЕНИЯ: {sw.Elapsed.TotalSeconds:F3} сек.");
+            Console.WriteLine($"Всего задач (тесты + нагрузка) подготовлено: {loadTasks.Count}");
+
+            using (var pool = new CustomThreadPool(minThreads: 2, maxThreads: 8, idleTimeoutMs: 1000, stuckTimeoutMs: 3000))
+            {
+                var sw = Stopwatch.StartNew();
+
+                Console.WriteLine("\n[Сценарий] Этап 1: Пиковая нагрузка (мгновенно подаем 20 тестов)...");
+                for (int i = 0; i < 20; i++) 
+                    pool.Enqueue(loadTasks[i]);
+
+                Console.WriteLine("\n[Сценарий] Этап 2: Простой системы (ждем 4 секунды для срабатывания адаптивного сжатия)...");
+                Thread.Sleep(4000);
+
+                Console.WriteLine("\n[Сценарий] Этап 3: Единичные подачи (подаем 10 тестов с паузами)...");
+                for (int i = 20; i < 30; i++)
+                {
+                    pool.Enqueue(loadTasks[i]);
+                    Thread.Sleep(400);
+                }
+
+                Console.WriteLine("\n[Сценарий] Этап 4: Вторая пиковая нагрузка (подаем оставшиеся тесты)...");
+                for (int i = 30; i < loadTasks.Count; i++) pool.Enqueue(loadTasks[i]);
+
+                Console.WriteLine("\n[Ожидание] Ждем завершения всех тестов...\n");
+                pool.WaitAll();
+                sw.Stop();
+
+                Console.WriteLine($"\nИТОГО: Запущено: {_total}, Успешно: {_passed}, Провалено: {_failed}");
+                Console.WriteLine($"ВРЕМЯ ВЫПОЛНЕНИЯ: {sw.Elapsed.TotalSeconds:F3} сек.");
+            }
+
             Console.ReadLine();
         }
 
@@ -39,210 +75,136 @@ namespace TestRunner
                 .ToArray();
         }
 
-        private static (int t, int p, int f) RunAllTests(Type[] classes, int maxDegree)
+        private static List<Action> CreateTestActions(Type[] classes)
         {
-            int t = 0, p = 0, f = 0;
+            var actions = new List<Action>();
             foreach (var type in classes)
             {
-                var res = RunTestsForClass(type, maxDegree);
-                t += res.t; p += res.p; f += res.f;
-            }
-            return (t, p, f);
-        }
+                var classAttr = type.GetCustomAttribute<TestClassAttribute>();
+                bool runParallel = classAttr?.RunParallel ?? true;
 
-        static (int t, int p, int f) RunTestsForClass(Type type, int maxDegree)
-        {
-            LogClassName(type);
+                var context = CreateSharedContext(type);
+                context?.Init();
 
-            
-            var context = CreateSharedContext(type);
-            context?.Init();
+                var methods = type.GetMethods();
+                var setup = methods.FirstOrDefault(m => m.HasAttr<SetupAttribute>());
+                var teardown = methods.FirstOrDefault(m => m.HasAttr<TeardownAttribute>());
 
-           
-            var methods = type.GetMethods();
-            var setup = methods.FirstOrDefault(m => m.HasAttr<SetupAttribute>());
-            var teardown = methods.FirstOrDefault(m => m.HasAttr<TeardownAttribute>());
+                var tests = methods.Where(m => m.HasAttr<TestMethodAttribute>())
+                                   .OrderBy(m => m.GetCustomAttribute<TestMethodAttribute>()!.Priority)
+                                   .ToList();
 
-            var classAttr = type.GetCustomAttribute<TestClassAttribute>();
-            bool runParallel = classAttr?.RunParallel ?? true;
-
-
-            int t = 0, p = 0, f = 0;
-            var tests = GetSortedTests(methods).ToList();
-
-            if (runParallel)
-            {
-                var options = new ParallelOptions { MaxDegreeOfParallelism = maxDegree };
-
-                Parallel.ForEach(tests, options, method =>
+                if (runParallel)
                 {
-                    var (mt, mp, mf) = RunTestMethod(type, method, setup, teardown, context);
-                    Interlocked.Add(ref t, mt);
-                    Interlocked.Add(ref p, mp);
-                    Interlocked.Add(ref f, mf);
-                });
-            }
-            else
-            {
-                foreach (var method in tests)
+                    foreach (var method in tests)
+                    {
+                        var attr = method.GetCustomAttribute<TestMethodAttribute>()!;
+                        if (attr.Skip) continue;
+
+                        var testCases = method.GetCustomAttributes<TestCaseAttribute>().Select(a => a.Arguments).DefaultIfEmpty(null);
+
+                        foreach (var args in testCases)
+                        {
+                            actions.Add(() => ExecuteTest(type, method, setup, teardown, context, args));
+                        }
+                    }
+                }
+                else
                 {
-                    var (mt, mp, mf) = RunTestMethod(type, method, setup, teardown, context);
-                    t += mt; p += mp; f += mf;
+                    actions.Add(() =>
+                    {
+                        foreach (var method in tests)
+                        {
+                            var attr = method.GetCustomAttribute<TestMethodAttribute>()!;
+                            if (attr.Skip) continue;
+
+                            var testCases = method.GetCustomAttributes<TestCaseAttribute>().Select(a => a.Arguments).DefaultIfEmpty(null);
+
+                            foreach (var args in testCases)
+                            {
+                                ExecuteTest(type, method, setup, teardown, context, args);
+                            }
+                        }
+                    });
                 }
             }
-
-            context?.Cleanup();
-            return (t, p, f);
+            return actions;
         }
 
-        static (int t, int p, int f) RunTestMethod(Type type, MethodInfo m, MethodInfo? s, MethodInfo? td, object? ctx)
+        private static void ExecuteTest(Type type, MethodInfo m, MethodInfo? s, MethodInfo? td, object? ctx, object[]? args)
         {
-            var attr = m.GetCustomAttribute<TestMethodAttribute>()!;
-            if (attr.Skip)
-            {
-                PrintStatus(m.Name, "SKIPPED", ConsoleColor.Yellow);
-                return (0, 0, 0);
-            }
-
-            int t = 0, p = 0, f = 0;
-            var testCases = m.GetCustomAttributes<TestCaseAttribute>()
-                .Select(a => a.Arguments)
-                .DefaultIfEmpty(null);
-
-            foreach (var args in testCases)
-            {
-                t++;
-                bool success = Execute(type, m, s, td, ctx, args);
-                if (success) p++; else f++;
-            }
-            return (t, p, f);
-        }
-
-        static bool Execute(Type type, MethodInfo m, MethodInfo? s, MethodInfo? td, object? ctx, object[]? args)
-        {
+            Interlocked.Increment(ref _total);
             string name = FormatTestName(m, args);
-
-            var timeoutAttr = m.GetCustomAttribute<TimeoutAttribute>();
-            int timeoutMs = timeoutAttr?.Milliseconds ?? -1;
 
             try
             {
-                object? instance = CreateInstance(type, ctx);
+                object? instance = ctx != null ? Activator.CreateInstance(type, ctx) : Activator.CreateInstance(type);
+                s?.Invoke(instance, null);
 
-                \Action testAction = () =>
+                try
                 {
-                    s?.Invoke(instance, null);       
-                    try
-                    {
-                        m.Invoke(instance, args);    
-                    }
-                    catch (TargetInvocationException ex)
-                    {
-                        throw ex.InnerException!;
-                    }
-                    finally
-                    {
-                        InvokeSafe(td, instance);   
-                    }
-                };
-
-                Task task = Task.Run(testAction);
-
-                bool completedInTime = task.Wait(timeoutMs);
-
-                if (!completedInTime)
+                    m.Invoke(instance, args);
+                }
+                catch (TargetInvocationException ex)
                 {
-                    PrintStatus(name, "FAILED", ConsoleColor.Red, $"Timeout ({timeoutMs}ms)");
-                    return false;
+                    if (ex.InnerException is ThreadInterruptedException)
+                    {
+                        Interlocked.Increment(ref _failed);
+                        PrintStatus(name, "TIMEOUT", ConsoleColor.Magenta, "Поток завис и был заменен пулом");
+                        return;
+                    }
+                    throw ex.InnerException!;
+                }
+                finally
+                {
+                    try { td?.Invoke(instance, null); } catch { }
                 }
 
-                if (task.IsFaulted)
-                {
-                    throw task.Exception!.InnerException!;
-                }
-
-                PrintStatus(name, "PASSED", ConsoleColor.Green, $"(Thread {Thread.CurrentThread.ManagedThreadId})");
-                return true;
+                Interlocked.Increment(ref _passed);
+                PrintStatus(name, "PASSED", ConsoleColor.Green);
+            }
+            catch (TestAssertionException ex)
+            {
+                Interlocked.Increment(ref _failed);
+                PrintStatus(name, "FAILED", ConsoleColor.Red, ex.Message);
             }
             catch (Exception ex)
             {
-                HandleException(name, ex);
-                return false;
+                Interlocked.Increment(ref _failed);
+                PrintStatus(name, "ERROR", ConsoleColor.DarkRed, ex.Message);
             }
-        }
-
-        private static object CreateInstance(Type type, object? ctx)
-        {
-            return ctx != null 
-                ? Activator.CreateInstance(type, ctx)! 
-                : Activator.CreateInstance(type)!;
-        }
-
-        private static void HandleException(string name, Exception ex)
-        {
-            var err = ex is AggregateException ae ? ae.Flatten().InnerException : ex;
-            bool isAssert = err is TestAssertionException;
-            
-            var status = isAssert ? "FAILED" : "ERROR";
-            var color = isAssert ? ConsoleColor.Red : ConsoleColor.DarkRed;
-
-            PrintStatus(name, status, color, err?.Message);
-        }
-
-        private static void InvokeSafe(MethodInfo? method, object? instance)
-        {
-            try { method?.Invoke(instance, null); } catch { }
-        }
-
-        private static IOrderedEnumerable<MethodInfo> GetSortedTests(MethodInfo[] methods)
-        {
-            return methods
-                .Where(m => m.HasAttr<TestMethodAttribute>())
-                .OrderBy(m => m.GetCustomAttribute<TestMethodAttribute>()!.Priority);
         }
 
         private static ISharedContext? CreateSharedContext(Type type)
         {
             var attr = type.GetCustomAttribute<UseSharedContextAttribute>();
-            if (attr == null) return null;
-            return Activator.CreateInstance(attr.ContextType) as ISharedContext;
+            return attr != null ? Activator.CreateInstance(attr.ContextType) as ISharedContext : null;
         }
 
         private static string FormatTestName(MethodInfo m, object[]? args)
         {
-            if (args == null) return m.Name;
-            return $"{m.Name}({string.Join(", ", args)})";
+            return args == null ? m.Name : $"{m.Name}({string.Join(", ", args)})";
         }
 
-        private static void LogClassName(Type type)
+        private static void PrintStatus(string testName, string status, ConsoleColor color, string? msg = null)
         {
-            lock (_consoleLock)
-            {
-                var attr = type.GetCustomAttribute<TestClassAttribute>();
-                Console.ForegroundColor = ConsoleColor.Cyan;
-                Console.WriteLine($"\nКЛАСС: {type.Name} {attr?.Description}");
-                Console.ResetColor();
-            }
-        }
+            int workerId = CustomThreadPool.CurrentWorkerId.Value;
+            string wIdStr = workerId > 0 ? workerId.ToString("D2") : "--";
 
-        private static void PrintStatus(string n, string s, ConsoleColor c, string? msg = null)
-        {
-            lock (_consoleLock)
-            {
+            string outputLine = $"[Поток {wIdStr}] {testName,-35} {status}";
+            if (msg != null) outputLine += $" -> {msg}";
 
-                Console.Write($"[{n}] ");
-                Console.ForegroundColor = c;
-                Console.Write(s);
+            lock (Console.Out)
+            {
+                Console.ForegroundColor = color;
+                Console.WriteLine(outputLine);
                 Console.ResetColor();
-                if (msg != null) Console.Write($" -> {msg}");
-                Console.WriteLine();
             }
         }
     }
 
-    public static class Ext 
+    public static class Ext
     {
-        public static bool HasAttr<T>(this MemberInfo m) where T : Attribute 
-            => m.GetCustomAttribute<T>() != null;
+        public static bool HasAttr<T>(this MemberInfo m) where T : Attribute => m.GetCustomAttribute<T>() != null;
     }
 }
