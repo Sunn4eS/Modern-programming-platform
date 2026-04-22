@@ -5,9 +5,29 @@ using System.Threading;
 
 namespace TestFramework
 {
+    public class ThreadPoolEventArgs : EventArgs
+    {
+        public string Message { get; }
+        public int WorkerId { get; }
+        public DateTime Timestamp { get; }
+
+        public ThreadPoolEventArgs(string message, int workerId = 0)
+        {
+            Message = message;
+            WorkerId = workerId;
+            Timestamp = DateTime.Now;
+        }
+    }
+
     public class CustomThreadPool : IDisposable
     {
         public static readonly ThreadLocal<int> CurrentWorkerId = new ThreadLocal<int>();
+
+        public event EventHandler<ThreadPoolEventArgs> WorkerCreated;  
+        public event EventHandler<ThreadPoolEventArgs> WorkerRemoved;  
+        public event EventHandler<ThreadPoolEventArgs> TaskStarted;    
+        public event EventHandler<ThreadPoolEventArgs> TaskCompleted;  
+        public event EventHandler<ThreadPoolEventArgs> ThreadStuck;    
 
         private readonly int _minThreads;
         private readonly int _maxThreads;
@@ -16,7 +36,6 @@ namespace TestFramework
 
         private readonly Queue<Action> _queue = new Queue<Action>();
         private readonly List<Worker> _workers = new List<Worker>();
-
         private readonly Stack<int> _availableIds = new Stack<int>();
         private readonly object _lock = new object();
 
@@ -33,7 +52,10 @@ namespace TestFramework
 
             for (int i = maxThreads; i >= 1; i--) _availableIds.Push(i);
 
-            for (int i = 0; i < _minThreads; i++) AddWorker();
+            lock (_lock)
+            {
+                for (int i = 0; i < _minThreads; i++) AddWorker();
+            }
 
             _supervisor = new Thread(SupervisorLoop) { IsBackground = true };
             _supervisor.Start();
@@ -65,19 +87,14 @@ namespace TestFramework
             worker.Thread = thread;
             _workers.Add(worker);
 
-            SafePrint($"[Мониторинг] Потоков: {_workers.Count}/{_maxThreads}", ConsoleColor.Cyan);
+           
+            WorkerCreated?.Invoke(this, new ThreadPoolEventArgs("Поток создан", workerId));
             thread.Start();
         }
 
         public void WaitAll()
         {
             while (Volatile.Read(ref _pendingTasks) > 0) Thread.Sleep(100);
-        }
-
-        public void Dispose()
-        {
-            _isShuttingDown = true;
-            lock (_lock) Monitor.PulseAll(_lock);
         }
 
         private void SupervisorLoop()
@@ -87,38 +104,31 @@ namespace TestFramework
                 Thread.Sleep(500);
                 lock (_lock)
                 {
-                    int workingCount = 0;
                     for (int i = _workers.Count - 1; i >= 0; i--)
                     {
                         var w = _workers[i];
-                        if (w.IsWorking)
+                        if (w.IsWorking && w.TaskStartTime.HasValue)
                         {
-                            workingCount++;
-                            if (w.TaskStartTime.HasValue && (DateTime.Now - w.TaskStartTime.Value).TotalMilliseconds > _stuckTimeoutMs)
+                            var duration = (DateTime.Now - w.TaskStartTime.Value).TotalMilliseconds;
+                            if (duration > _stuckTimeoutMs)
                             {
-                                SafePrint($"[Пул] Отказ: Поток {w.Id:D2} завис. Удаление и пересоздание...", ConsoleColor.Magenta);
+                                ThreadStuck?.Invoke(this, new ThreadPoolEventArgs($"Поток завис ({duration:F0}мс)", w.Id));
 
-                                w.Thread.Interrupt();
+                                w.Thread.Interrupt(); 
                                 _workers.RemoveAt(i);
                                 _availableIds.Push(w.Id);
-                                AddWorker();
+                                AddWorker(); 
                             }
                         }
                     }
-
-                    SafePrint($"[Мониторинг] Потоков: {_workers.Count}/{_maxThreads} (Активно: {workingCount}), Задач в очереди: {_queue.Count}", ConsoleColor.Cyan);
                 }
             }
         }
 
-        private static void SafePrint(string message, ConsoleColor color)
+        public void Dispose()
         {
-            lock (Console.Out)
-            {
-                Console.ForegroundColor = color;
-                Console.WriteLine(message);
-                Console.ResetColor();
-            }
+            _isShuttingDown = true;
+            lock (_lock) Monitor.PulseAll(_lock);
         }
 
         private class Worker
@@ -146,16 +156,13 @@ namespace TestFramework
                     {
                         while (_pool._queue.Count == 0 && !_pool._isShuttingDown)
                         {
-                            bool signaled = Monitor.Wait(_pool._lock, _pool._idleTimeoutMs);
-
-                            if (!signaled)
+                            if (!Monitor.Wait(_pool._lock, _pool._idleTimeoutMs))
                             {
                                 if (_pool._workers.Count > _pool._minThreads)
                                 {
                                     _pool._workers.Remove(this);
                                     _pool._availableIds.Push(Id);
-
-                                    SafePrint($"[Пул] Сжатие: Поток {Id:D2} простаивал и был удален.", ConsoleColor.DarkYellow);
+                                    _pool.WorkerRemoved?.Invoke(_pool, new ThreadPoolEventArgs("Поток удален по простою", Id));
                                     return;
                                 }
                             }
@@ -168,7 +175,11 @@ namespace TestFramework
                         TaskStartTime = DateTime.Now;
                     }
 
+                    _pool.TaskStarted?.Invoke(_pool, new ThreadPoolEventArgs("Задача запущена", Id));
+
                     try { task(); }
+                    catch (ThreadInterruptedException) {}
+                    catch (Exception) { }
                     finally
                     {
                         lock (_pool._lock)
@@ -176,6 +187,7 @@ namespace TestFramework
                             IsWorking = false;
                             TaskStartTime = null;
                         }
+                        _pool.TaskCompleted?.Invoke(_pool, new ThreadPoolEventArgs("Задача завершена", Id));
                         Interlocked.Decrement(ref _pool._pendingTasks);
                     }
                 }

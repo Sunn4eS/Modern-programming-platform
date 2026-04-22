@@ -41,6 +41,7 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="AdvancedTests.cs" />
     <Compile Include="SharedContextTesting.cs" />
     <Compile Include="UserTests.cs" />
     <Compile Include="ValidationTests.cs" />
