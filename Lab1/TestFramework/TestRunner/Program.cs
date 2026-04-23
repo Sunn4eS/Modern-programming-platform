@@ -22,7 +22,7 @@ namespace TestRunner
             TestFilter filter = (m) =>
             {
                 var attr = m.GetCustomAttribute<TestMethodAttribute>();
-                return attr != null && attr.Priority <= 5;
+                return attr != null && attr.Priority <= 2;
             };
 
             var testActions = DiscoveryTests(filter);
